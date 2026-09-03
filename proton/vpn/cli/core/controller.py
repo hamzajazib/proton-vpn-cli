@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib import metadata
 import random
+from threading import Event
 from types import TracebackType
 from typing import Callable, List, Optional, Type, Union
 
@@ -30,6 +31,7 @@ from click.core import Context as ClickContext
 from packaging.version import Version
 import sentry_sdk
 
+from proton.session.api import Fido2Assertion
 from proton.session.exceptions import ProtonAPIAuthenticationNeeded
 from proton.vpn.core.settings.custom_dns import CustomDNSEntry, CustomDNS
 from proton.vpn import logging as ProtonLogging
@@ -54,10 +56,12 @@ from proton.vpn.core.session_holder import ClientTypeMetadata
 from proton.vpn.core.settings import Settings
 from proton.vpn.session import ServerList
 from proton.vpn.session.dataclasses.servers import Country
+from proton.vpn.session.exceptions import SecurityKeyError
 from proton.vpn.session.servers.country_codes import \
     validate_country_code, \
     get_country_code_for_name
 from proton.vpn.session.servers.types import LogicalServer, ServerFeatureEnum
+from proton.vpn.session.u2f_interaction import UserInteraction
 
 DEFAULT_CLI_NAME = "protonvpn"
 
@@ -228,6 +232,14 @@ class Controller:  # pylint: disable=too-many-public-methods
         Returns the Proton VPN account name if currently logged in.
         """
         return self._api.account_name
+
+    @property
+    def supports_security_key(self) -> bool:
+        """
+        Returns whether a registered security key can complete the two factor
+        authentication that is currently pending.
+        """
+        return self._api.supports_fido2
 
     async def get_settings(self) -> Settings:
         """Returns general settings."""
@@ -493,14 +505,12 @@ class Controller:  # pylint: disable=too-many-public-methods
                 await self._disconnect()
 
     async def login(self, username: str,
-                    get_password: Callable[[], str],
-                    get_2fa: Callable[[], str]):
+                    get_password: Callable[[], str]) -> bool:
         """
         Logs the user in.
         :param username:
         :param get_password: A callable that will return the account password
-        :param get_2fa: A callable that will return the two factor
-            authentication token if invoked.
+        :return: whether two factor authentication is still required.
         """
         if self._api.is_user_logged_in():
             raise SignoutRequiredError
@@ -510,11 +520,52 @@ class Controller:  # pylint: disable=too-many-public-methods
         if not login_result.authenticated:
             raise AuthenticationFailedError
 
+        return login_result.twofa_required
+
+    async def submit_2fa_code(self, code: str) -> bool:
+        """
+        Submits an authenticator app or recovery code.
+        :param code: the code to submit.
+        :return: whether the code was accepted.
+        """
         try:
-            while login_result.twofa_required:
-                login_result = await self._api.submit_2fa_code(get_2fa())
+            return (await self._api.submit_2fa_code(code)).success
         except ProtonAPIAuthenticationNeeded as exc:
             raise Authentication2FAFailedError from exc
+
+    async def generate_security_key_assertion(
+        self, user_interaction: UserInteraction
+    ) -> Fido2Assertion:
+        """
+        Reads the security key, returning once the user has touched it.
+        :param user_interaction: handles whatever the key asks the user for
+            while it is being read.
+        :raises SecurityKeyError: if the key could not be read.
+        """
+        # asyncio.run joins the api's worker thread after this coroutine has
+        # unwound, so cancelling the read here is what lets a Ctrl+C return.
+        cancel_assertion = Event()
+        try:
+            return await self._api.generate_2fa_fido2_assertion(
+                user_interaction, cancel_assertion=cancel_assertion
+            )
+        except asyncio.CancelledError:
+            cancel_assertion.set()
+            raise
+
+    async def submit_security_key_assertion(self, assertion: Fido2Assertion):
+        """
+        Completes two factor authentication with a security key assertion.
+        :param assertion: the assertion the key produced.
+        :raises SecurityKeyError: if the assertion was rejected.
+        """
+        try:
+            accepted = (await self._api.submit_2fa_fido2(assertion)).success
+        except ProtonAPIAuthenticationNeeded as exc:
+            raise SecurityKeyError("The session was invalidated") from exc
+
+        if not accepted:
+            raise SecurityKeyError("The security key assertion was rejected")
 
     async def logout(self):
         """

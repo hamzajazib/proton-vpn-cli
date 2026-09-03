@@ -47,6 +47,8 @@ def controller_mock(test_context: click.Context) -> AsyncMock:
     controller_mock = AsyncMock(spec=Controller)
     type(controller_mock).program_name = \
         PropertyMock(return_value=test_context.info_name)
+    # Sign in without two factor authentication unless a test asks for it.
+    controller_mock.login.return_value = False
     test_context.obj.overriding_controller = controller_mock
     return controller_mock
 

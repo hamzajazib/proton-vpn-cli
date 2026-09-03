@@ -16,18 +16,27 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with ProtonVPN.  If not, see <https://www.gnu.org/licenses/>.
 """
+import asyncio
 from unittest.mock import AsyncMock, Mock, PropertyMock
 import pytest
 
 from click.core import Context as ClickContext
 
+from proton.session.exceptions import ProtonAPIAuthenticationNeeded
 from proton.vpn.cli.core.controller import Controller, Params, Feature
 from proton.vpn.cli.core.exceptions import \
+    Authentication2FAFailedError, \
+    AuthenticationFailedError, \
     AuthenticationRequiredError, \
-    RequiresHigherTierError
+    RequiresHigherTierError, \
+    SignoutRequiredError
 from proton.vpn.connection import states
 from proton.vpn.core.api import ProtonVPNAPI, VPNDataRefresher, Settings
 from proton.vpn.core.vpnconnector import VPNConnector
+from proton.vpn.session.dataclasses import LoginResult
+from proton.vpn.session.exceptions import \
+    SecurityKeyError, \
+    SecurityKeyNotFoundError
 from proton.vpn.session.servers.types import LogicalServer, ServerFeatureEnum
 
 
@@ -263,3 +272,156 @@ async def test_save_settings_does_not_wait_for_confirmation_when_requesting_free
     # check that a Connection event listener was not registered
     vpn_connector_mock.register.assert_not_called()
     api_mock.save_settings.assert_called_with(settings)
+
+
+def _api_mock() -> AsyncMock:
+    api_mock = AsyncMock(spec=ProtonVPNAPI)
+    api_mock.is_user_logged_in.return_value = False
+    return api_mock
+
+
+def _controller(api_mock: AsyncMock) -> Controller:
+    return Controller(Mock(spec=Params), Mock(spec=ClickContext), api_mock)
+
+
+def _login_result(
+    success: bool = True,
+    authenticated: bool = True,
+    twofa_required: bool = False
+) -> LoginResult:
+    return LoginResult(
+        success=success,
+        authenticated=authenticated,
+        twofa_required=twofa_required
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("twofa_required", [True, False])
+async def test_login_returns_whether_2fa_is_still_required(twofa_required):
+    api_mock = _api_mock()
+    api_mock.login.return_value = _login_result(
+        success=not twofa_required, twofa_required=twofa_required
+    )
+
+    assert await _controller(api_mock).login("user", lambda: "pass") is twofa_required
+
+
+@pytest.mark.asyncio
+async def test_login_fails_when_already_signed_in():
+    api_mock = _api_mock()
+    api_mock.is_user_logged_in.return_value = True
+
+    with pytest.raises(SignoutRequiredError):
+        await _controller(api_mock).login("user", lambda: "pass")
+
+
+@pytest.mark.asyncio
+async def test_login_fails_when_the_password_is_rejected():
+    api_mock = _api_mock()
+    api_mock.login.return_value = _login_result(success=False, authenticated=False)
+
+    with pytest.raises(AuthenticationFailedError):
+        await _controller(api_mock).login("user", lambda: "pass")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_submit_2fa_code_returns_whether_the_code_was_accepted(accepted):
+    api_mock = _api_mock()
+    api_mock.submit_2fa_code.return_value = _login_result(
+        success=accepted, twofa_required=not accepted
+    )
+
+    assert await _controller(api_mock).submit_2fa_code("123456") is accepted
+
+
+@pytest.mark.asyncio
+async def test_submit_2fa_code_fails_when_the_api_invalidates_the_session():
+    api_mock = _api_mock()
+    api_mock.submit_2fa_code.side_effect = ProtonAPIAuthenticationNeeded(
+        401, {}, {"Code": 8002, "Error": "Incorrect login credentials"}
+    )
+
+    with pytest.raises(Authentication2FAFailedError):
+        await _controller(api_mock).submit_2fa_code("123456")
+
+
+@pytest.mark.asyncio
+async def test_supports_security_key_follows_the_api():
+    api_mock = _api_mock()
+    type(api_mock).supports_fido2 = PropertyMock(return_value=True)
+
+    assert _controller(api_mock).supports_security_key is True
+
+
+@pytest.mark.asyncio
+async def test_generate_security_key_assertion_returns_what_the_key_produced():
+    api_mock = _api_mock()
+    assertion = Mock()
+    api_mock.generate_2fa_fido2_assertion.return_value = assertion
+
+    read = await _controller(api_mock).generate_security_key_assertion(Mock())
+
+    assert read is assertion
+
+
+@pytest.mark.asyncio
+async def test_submit_security_key_assertion_submits_it():
+    api_mock = _api_mock()
+    assertion = Mock()
+    api_mock.submit_2fa_fido2.return_value = _login_result()
+
+    await _controller(api_mock).submit_security_key_assertion(assertion)
+
+    api_mock.submit_2fa_fido2.assert_awaited_once_with(assertion)
+
+
+@pytest.mark.asyncio
+async def test_generate_security_key_assertion_lets_security_key_errors_through():
+    api_mock = _api_mock()
+    api_mock.generate_2fa_fido2_assertion.side_effect = SecurityKeyNotFoundError("nope")
+
+    # The command layer maps these to messages, so they must not be swallowed
+    # or renamed on the way out.
+    with pytest.raises(SecurityKeyNotFoundError):
+        await _controller(api_mock).generate_security_key_assertion(Mock())
+
+    # One failed read ends the attempt, the key is not re-armed here.
+    assert api_mock.generate_2fa_fido2_assertion.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_security_key_assertion_fails_when_it_is_rejected():
+    api_mock = _api_mock()
+    api_mock.submit_2fa_fido2.return_value = _login_result(
+        success=False, twofa_required=True
+    )
+
+    with pytest.raises(SecurityKeyError):
+        await _controller(api_mock).submit_security_key_assertion(Mock())
+
+
+@pytest.mark.asyncio
+async def test_generate_security_key_assertion_stops_the_key_waiting_when_cancelled():
+    api_mock = _api_mock()
+    waiting = asyncio.Event()
+    cancel_tokens = []
+
+    async def wait_for_a_touch(_user_interaction, cancel_assertion):
+        cancel_tokens.append(cancel_assertion)
+        waiting.set()
+        await asyncio.sleep(3600)
+
+    api_mock.generate_2fa_fido2_assertion.side_effect = wait_for_a_touch
+
+    task = asyncio.create_task(
+        _controller(api_mock).generate_security_key_assertion(Mock())
+    )
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The key is told to stop waiting, so the CLI can exit right away.
+    assert cancel_tokens[0].is_set()
